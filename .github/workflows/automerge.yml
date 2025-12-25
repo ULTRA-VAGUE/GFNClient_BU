@@ -1,0 +1,134 @@
+name: Universal upstream sync
+
+# ───────────────────────────────────────────────────────────────
+# 🔧 REQUIRED SETUP
+# Add this repository secret before running the workflow:
+#
+# UPSTREAM_SYNC_PAT  →  GitHub Personal Access Token
+#        Scopes: repo, workflow
+#
+# Location:
+#   Settings → Secrets → Actions → New repository secret
+# ───────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '0 8 * * *'  # daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: "zortos293/GFNClient"   # <---- Change Repo you want to Copy
+  UPSTREAM_BRANCH: "main"             # <---- Change Branch Name
+  MAX_RELEASES: 2                     # <---- How many releases to pull
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+
+    steps:
+      # --- CHECKOUT ---
+      - name: Checkout fork branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.UPSTREAM_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_PAT }} # WICHTIG: PAT für Workflow-Schreibrechte nutzen
+
+      # --- GIT SETUP ---
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # --- MERGE UPSTREAM BRANCH ---
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          # WICHTIG: --force hinzugefügt, um Tag-Konflikte zu lösen
+          git fetch upstream --tags --force --prune
+
+      - name: Merge upstream branch
+        run: |
+          git merge upstream/${{ env.UPSTREAM_BRANCH }} \
+            --allow-unrelated-histories --no-edit || echo "No merge or conflict"
+
+      - name: Push merged branch
+        run: git push origin ${{ env.UPSTREAM_BRANCH }}
+
+      # --- TAG SYNC ---
+      - name: Sync tags
+        run: |
+          git fetch upstream --tags --force
+          # WICHTIG: --force beim Push, falls Tags im Fork veraltet sind
+          git push origin --tags --force
+
+      # --- RELEASE SYNC (ONLY LATEST N RELEASES) ---
+      - name: Sync latest releases + assets
+        env:
+          TOKEN: ${{ secrets.UPSTREAM_SYNC_PAT }}
+          REPO_FORK: ${{ github.repository }}
+        run: |
+          echo "Fetching latest releases (max $MAX_RELEASES)…"
+
+          # Get the latest N releases from upstream
+          UPSTREAM_RELEASES=$(curl -s -H "Authorization: token $TOKEN" \
+            https://api.github.com/repos/${UPSTREAM_REPO}/releases \
+            | jq ".[0:${MAX_RELEASES}]")
+
+          echo "$UPSTREAM_RELEASES" | jq -c '.[]' | while read rel; do
+            TAG=$(echo "$rel" | jq -r '.tag_name')
+            NAME=$(echo "$rel" | jq -r '.name')
+            BODY=$(echo "$rel" | jq -r '.body' | jq -Rs .)
+            DRAFT=$(echo "$rel" | jq -r '.draft')
+            PRERELEASE=$(echo "$rel" | jq -r '.prerelease')
+
+            echo "➡️ Syncing release $TAG"
+
+            # Check if release exists
+            EXISTING=$(curl -s -H "Authorization: token $TOKEN" \
+              https://api.github.com/repos/${REPO_FORK}/releases/tags/$TAG)
+
+            if [[ "$(echo "$EXISTING" | jq -r '.id')" == "null" ]]; then
+              echo "🆕 Creating fork release $TAG…"
+              RESPONSE=$(curl -s -X POST \
+                -H "Authorization: token $TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"tag_name\":\"$TAG\",\"name\":\"$NAME\",\"body\":$BODY,\"draft\":$DRAFT,\"prerelease\":$PRERELEASE}" \
+                https://api.github.com/repos/${REPO_FORK}/releases)
+            else
+              echo "✔️ Updating fork release $TAG…"
+              RELEASE_ID=$(echo "$EXISTING" | jq -r '.id')
+              RESPONSE=$(curl -s -X PATCH \
+                -H "Authorization: token $TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"name\":\"$NAME\",\"body\":$BODY,\"draft\":$DRAFT,\"prerelease\":$PRERELEASE}" \
+                https://api.github.com/repos/${REPO_FORK}/releases/$RELEASE_ID)
+            fi
+
+            RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
+
+            echo "⬇️ Syncing assets for $TAG…"
+            echo "$rel" | jq -c '.assets[]?' | while read asset; do
+              ASSET_NAME=$(echo "$asset" | jq -r '.name')
+              ASSET_URL=$(echo "$asset" | jq -r '.url')
+
+              echo "   → Downloading $ASSET_NAME"
+              curl -L \
+                -H "Authorization: token $TOKEN" \
+                -H "Accept: application/octet-stream" \
+                "$ASSET_URL" -o "$ASSET_NAME"
+
+              echo "   → Uploading $ASSET_NAME to fork release $TAG"
+              curl -s -X POST \
+                -H "Authorization: token $TOKEN" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary @"$ASSET_NAME" \
+                "https://uploads.github.com/repos/${REPO_FORK}/releases/$RELEASE_ID/assets?name=$ASSET_NAME"
+            done
+
+          done
+
+          echo "🎉 Finished syncing latest releases!"
