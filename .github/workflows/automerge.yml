@@ -1,69 +1,4 @@
-name: Universal upstream sync
-
-# ───────────────────────────────────────────────────────────────
-# 🔧 REQUIRED SETUP
-# Add this repository secret before running the workflow:
-#
-# UPSTREAM_SYNC_PAT  →  GitHub Personal Access Token
-#       Scopes: repo, workflow
-#
-# Location:
-#   Settings → Secrets → Actions → New repository secret
-# ───────────────────────────────────────────────────────────────
-
-on:
-  schedule:
-    - cron: '0 8 * * *'  # daily
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-env:
-  UPSTREAM_REPO: "zortos293/GFNClient"   # <---- Change Repo you want to Copy
-  UPSTREAM_BRANCH: "main"             # <---- Change Branch Name
-  MAX_RELEASES: 2                     # <---- How many releases to pull
-
-jobs:
-  sync-upstream:
-    runs-on: ubuntu-latest
-
-    steps:
-      # --- CHECKOUT ---
-      - name: Checkout fork branch
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ env.UPSTREAM_BRANCH }}
-          fetch-depth: 0
-          token: ${{ secrets.UPSTREAM_SYNC_PAT }}
-
-      # --- GIT SETUP ---
-      - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      # --- MERGE UPSTREAM BRANCH ---
-      - name: Add upstream remote
-        run: |
-          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
-          git fetch upstream --tags --force --prune
-
-      - name: Merge upstream branch
-        run: |
-          git merge upstream/${{ env.UPSTREAM_BRANCH }} \
-            --allow-unrelated-histories --no-edit || echo "No merge or conflict"
-
-      - name: Push merged branch
-        run: git push origin ${{ env.UPSTREAM_BRANCH }}
-
-      # --- TAG SYNC ---
-      - name: Sync tags
-        run: |
-          git fetch upstream --tags --force
-          git push origin --tags --force
-
-      # --- RELEASE SYNC ---
+# --- RELEASE SYNC (OPTIMIZED VERSION) ---
       - name: Sync latest releases + assets
         env:
           TOKEN: ${{ secrets.UPSTREAM_SYNC_PAT }}
@@ -71,20 +6,23 @@ jobs:
         run: |
           echo "Fetching latest releases (max $MAX_RELEASES)…"
 
-          # 1. Download in Datei statt Variable (verhindert Pipe-Fehler)
+          # 1. Download mit API-Limitierung (?per_page=...)
+          # Das verhindert riesige Dateien und Abbruchfehler
           curl -s -H "Authorization: token $TOKEN" \
-            "https://api.github.com/repos/${UPSTREAM_REPO}/releases" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=${MAX_RELEASES}" \
             -o releases.json
 
-          # 2. Validierung: Ist die Datei gültiges JSON?
+          # 2. Sicherheitscheck: Dateiinhalt prüfen bei Fehler
           if ! jq -e . releases.json >/dev/null 2>&1; then
-            echo "❌ CRITICAL ERROR: Download failed or invalid JSON received."
+            echo "❌ CRITICAL ERROR: Invalid JSON received."
+            echo "--- FILE CONTENT START ---"
             cat releases.json
+            echo "--- FILE CONTENT END ---"
             exit 1
           fi
 
-          # 3. Verarbeitung der Datei
-          cat releases.json | jq ".[0:${MAX_RELEASES}]" | jq -c '.[]' | while read rel; do
+          # 3. Verarbeitung (Vereinfacht)
+          cat releases.json | jq -c '.[]' | while read rel; do
             TAG=$(echo "$rel" | jq -r '.tag_name')
             NAME=$(echo "$rel" | jq -r '.name')
             BODY=$(echo "$rel" | jq -r '.body' | jq -Rs .)
@@ -143,7 +81,6 @@ jobs:
                 --data-binary @"$ASSET_NAME" \
                 "https://uploads.github.com/repos/${REPO_FORK}/releases/$RELEASE_ID/assets?name=$ASSET_NAME"
                 
-              # Cleanup downloaded asset to save space
               rm -f "$ASSET_NAME"
             done
 
