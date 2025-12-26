@@ -5,7 +5,7 @@ name: Universal upstream sync
 # Add this repository secret before running the workflow:
 #
 # UPSTREAM_SYNC_PAT  →  GitHub Personal Access Token
-#        Scopes: repo, workflow
+#       Scopes: repo, workflow
 #
 # Location:
 #   Settings → Secrets → Actions → New repository secret
@@ -35,7 +35,7 @@ jobs:
         with:
           ref: ${{ env.UPSTREAM_BRANCH }}
           fetch-depth: 0
-          token: ${{ secrets.UPSTREAM_SYNC_PAT }} # WICHTIG: PAT für Workflow-Schreibrechte nutzen
+          token: ${{ secrets.UPSTREAM_SYNC_PAT }}
 
       # --- GIT SETUP ---
       - name: Configure Git
@@ -47,7 +47,6 @@ jobs:
       - name: Add upstream remote
         run: |
           git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
-          # WICHTIG: --force hinzugefügt, um Tag-Konflikte zu lösen
           git fetch upstream --tags --force --prune
 
       - name: Merge upstream branch
@@ -62,10 +61,9 @@ jobs:
       - name: Sync tags
         run: |
           git fetch upstream --tags --force
-          # WICHTIG: --force beim Push, falls Tags im Fork veraltet sind
           git push origin --tags --force
 
-      # --- RELEASE SYNC (ONLY LATEST N RELEASES) ---
+      # --- RELEASE SYNC ---
       - name: Sync latest releases + assets
         env:
           TOKEN: ${{ secrets.UPSTREAM_SYNC_PAT }}
@@ -73,12 +71,20 @@ jobs:
         run: |
           echo "Fetching latest releases (max $MAX_RELEASES)…"
 
-          # Get the latest N releases from upstream
-          UPSTREAM_RELEASES=$(curl -s -H "Authorization: token $TOKEN" \
-            https://api.github.com/repos/${UPSTREAM_REPO}/releases \
-            | jq ".[0:${MAX_RELEASES}]")
+          # 1. Download in Datei statt Variable (verhindert Pipe-Fehler)
+          curl -s -H "Authorization: token $TOKEN" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases" \
+            -o releases.json
 
-          echo "$UPSTREAM_RELEASES" | jq -c '.[]' | while read rel; do
+          # 2. Validierung: Ist die Datei gültiges JSON?
+          if ! jq -e . releases.json >/dev/null 2>&1; then
+            echo "❌ CRITICAL ERROR: Download failed or invalid JSON received."
+            cat releases.json
+            exit 1
+          fi
+
+          # 3. Verarbeitung der Datei
+          cat releases.json | jq ".[0:${MAX_RELEASES}]" | jq -c '.[]' | while read rel; do
             TAG=$(echo "$rel" | jq -r '.tag_name')
             NAME=$(echo "$rel" | jq -r '.name')
             BODY=$(echo "$rel" | jq -r '.body' | jq -Rs .)
@@ -87,10 +93,11 @@ jobs:
 
             echo "➡️ Syncing release $TAG"
 
-            # Check if release exists
+            # Check if release exists on fork
             EXISTING=$(curl -s -H "Authorization: token $TOKEN" \
               https://api.github.com/repos/${REPO_FORK}/releases/tags/$TAG)
 
+            # Determine RELEASE_ID
             if [[ "$(echo "$EXISTING" | jq -r '.id')" == "null" ]]; then
               echo "🆕 Creating fork release $TAG…"
               RESPONSE=$(curl -s -X POST \
@@ -110,7 +117,15 @@ jobs:
 
             RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
 
-            echo "⬇️ Syncing assets for $TAG…"
+            if [ "$RELEASE_ID" == "null" ]; then
+               echo "❌ Error creating/updating release. Server response:"
+               echo "$RESPONSE"
+               continue
+            fi
+
+            echo "⬇️ Syncing assets for $TAG (Release ID: $RELEASE_ID)…"
+            
+            # Asset Sync Loop
             echo "$rel" | jq -c '.assets[]?' | while read asset; do
               ASSET_NAME=$(echo "$asset" | jq -r '.name')
               ASSET_URL=$(echo "$asset" | jq -r '.url')
@@ -127,6 +142,9 @@ jobs:
                 -H "Content-Type: application/octet-stream" \
                 --data-binary @"$ASSET_NAME" \
                 "https://uploads.github.com/repos/${REPO_FORK}/releases/$RELEASE_ID/assets?name=$ASSET_NAME"
+                
+              # Cleanup downloaded asset to save space
+              rm -f "$ASSET_NAME"
             done
 
           done
