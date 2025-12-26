@@ -231,8 +231,15 @@ export async function initializeStreaming(
     }
   }
 
+  // Parse FPS from options or use default
+  let streamFps = 60; // Default FPS
+  if (options?.fps && options.fps > 0) {
+    streamFps = options.fps;
+    console.log(`Using requested FPS: ${streamFps}`);
+  }
+
   // Connect using the official GFN browser protocol
-  await connectGfnBrowserSignaling(streamIp, sessionId, webrtcConfig, streamWidth, streamHeight);
+  await connectGfnBrowserSignaling(streamIp, sessionId, webrtcConfig, streamWidth, streamHeight, streamFps);
 }
 
 // GFN Browser Peer Protocol types
@@ -328,7 +335,8 @@ async function connectGfnBrowserSignaling(
   sessionId: string,
   config: WebRtcConfig,
   requestedWidth: number,
-  requestedHeight: number
+  requestedHeight: number,
+  requestedFps: number
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     // Generate random peer ID suffix (matching GFN browser format)
@@ -475,7 +483,7 @@ async function connectGfnBrowserSignaling(
 
               // Handle the SDP offer and create answer
               // This runs async - WebSocket may close during this, that's expected
-              handleGfnSdpOffer(innerMsg.sdp, ws, config, serverIp, requestedWidth, requestedHeight)
+              handleGfnSdpOffer(innerMsg.sdp, ws, config, serverIp, requestedWidth, requestedHeight, requestedFps)
                 .then(() => {
                   console.log("SDP offer handled successfully");
                   resolve();
@@ -503,6 +511,26 @@ async function connectGfnBrowserSignaling(
                   console.warn("Failed to add ICE candidate:", e);
                 }
               }
+            } else if (innerMsg.type === "candidate") {
+              // Alternative ICE candidate format
+              console.log("Received ICE candidate (type=candidate):", JSON.stringify(innerMsg));
+              if (streamingState.peerConnection && innerMsg.candidate) {
+                try {
+                  await streamingState.peerConnection.addIceCandidate(
+                    new RTCIceCandidate({
+                      candidate: innerMsg.candidate,
+                      sdpMid: innerMsg.sdpMid || "0",
+                      sdpMLineIndex: innerMsg.sdpMLineIndex ?? 0
+                    })
+                  );
+                  console.log("Added remote ICE candidate (alt format)");
+                } catch (e) {
+                  console.warn("Failed to add ICE candidate (alt format):", e);
+                }
+              }
+            } else {
+              // Log any unhandled peer_msg types for debugging
+              console.log("Unhandled peer_msg inner type:", JSON.stringify(innerMsg).substring(0, 300));
             }
           } catch (parseError) {
             console.log("peer_msg content is not JSON:", peerMsg.msg.substring(0, 100));
@@ -551,9 +579,10 @@ async function handleGfnSdpOffer(
   serverSdp: string,
   ws: WebSocket,
   config: WebRtcConfig,
-  _serverIp: string,  // Kept for potential future use (no longer used for ICE)
+  serverIp: string,
   requestedWidth: number,
-  requestedHeight: number
+  requestedHeight: number,
+  requestedFps: number
 ): Promise<void> {
   console.log("Setting up WebRTC with GFN SDP offer");
   console.log("SDP offer preview:", serverSdp.substring(0, 500));
@@ -816,6 +845,17 @@ async function handleGfnSdpOffer(
           const version = size >= 4 ? view.getUint16(2, true) : 0;
           console.log(`  *** HANDSHAKE: New format (0x020E), version=${version}`);
           inputProtocolVersion = version;
+
+          // CRITICAL: Send handshake response back to server
+          // Echo the received bytes to acknowledge the handshake
+          try {
+            const response = new Uint8Array(bytes.slice(0, size));
+            inputChannel.send(response.buffer);
+            console.log("  *** HANDSHAKE RESPONSE SENT:", Array.from(response).map(b => b.toString(16).padStart(2, '0')).join(' '));
+          } catch (err) {
+            console.error("  Failed to send handshake response:", err);
+          }
+
           inputHandshakeComplete = true;
           inputHandshakeAttempts++;
           streamStartTime = Date.now();
@@ -824,6 +864,16 @@ async function handleGfnSdpOffer(
           // Old format: first word is the version directly
           console.log(`  *** HANDSHAKE: Old format, version=${firstWord}`);
           inputProtocolVersion = firstWord;
+
+          // CRITICAL: Send handshake response back to server
+          try {
+            const response = new Uint8Array(bytes.slice(0, size));
+            inputChannel.send(response.buffer);
+            console.log("  *** HANDSHAKE RESPONSE SENT:", Array.from(response).map(b => b.toString(16).padStart(2, '0')).join(' '));
+          } catch (err) {
+            console.error("  Failed to send handshake response:", err);
+          }
+
           inputHandshakeComplete = true;
           inputHandshakeAttempts++;
           streamStartTime = Date.now();
@@ -931,83 +981,119 @@ async function handleGfnSdpOffer(
   const viewportHeight = requestedHeight;
   console.log(`nvstSdp viewport: ${viewportWidth}x${viewportHeight}`);
 
+  console.log(`nvstSdp video.maxFPS: ${requestedFps}`);
+
   // Use bitrate from config (set by user in settings)
   const maxBitrateKbps = config.max_bitrate_kbps || 100000;
   const minBitrateKbps = Math.min(10000, maxBitrateKbps / 10); // 10% of max or 10 Mbps
   const initialBitrateKbps = Math.round(maxBitrateKbps * 0.5); // Start at 50%
   console.log(`Bitrate settings: max=${maxBitrateKbps}kbps, min=${minBitrateKbps}kbps, initial=${initialBitrateKbps}kbps`);
 
-  // Build nvstSdp as a proper SDP-like string (matching official GFN browser client format)
-  // This includes ICE credentials, DTLS fingerprint, and streaming parameters
+  // Build nvstSdp matching official GFN browser client format
+  // Based on Wl function from vendor_beautified.js
+  const isHighFps = requestedFps >= 120;
+  const is120Fps = requestedFps === 120;
+  const is240Fps = requestedFps >= 240;
+
   const nvstSdpString = [
     "v=0",
     "o=SdpTest test_id_13 14 IN IPv4 127.0.0.1",
     "s=-",
     "t=0 0",
-    "a=runtime.serverTraceCapture:2",
-    "a=runtime.maxVerboseEtlSizeMb:45",
     `a=general.icePassword:${icePwd}`,
     `a=general.iceUserNameFragment:${iceUfrag}`,
     `a=general.dtlsFingerprint:${fingerprint}`,
     "m=video 0 RTP/AVP",
     "a=msid:fbc-video-0",
+    // FEC settings
+    "a=vqos.fec.rateDropWindow:10",
     "a=vqos.fec.minRequiredFecPackets:2",
-    "a=vqos.drc.enable:0",
-    "a=vqos.drc.minRequiredBitrateCheckEnabled:0",
+    "a=vqos.fec.repairMinPercent:5",
+    "a=vqos.fec.repairPercent:5",
+    "a=vqos.fec.repairMaxPercent:35",
+    // DRC settings - disable for high FPS, use DFC instead
+    ...(isHighFps ? [
+      "a=vqos.drc.enable:0",
+      "a=vqos.dfc.enable:1",
+      "a=vqos.dfc.decodeFpsAdjPercent:85",
+      "a=vqos.dfc.targetDownCooldownMs:250",
+      "a=vqos.dfc.dfcAlgoVersion:2",
+      `a=vqos.dfc.minTargetFps:${is120Fps ? 100 : 60}`,
+    ] : [
+      "a=vqos.drc.minRequiredBitrateCheckEnabled:1",
+    ]),
+    // Video encoder settings
     "a=video.dx9EnableNv12:1",
     "a=video.dx9EnableHdr:1",
-    "a=vqos.qpg.enable:0",
-    "a=vqos.resControl.enable:0",
-    "a=vqos.resControl.qp.qpg.featureSetting:0",
+    "a=vqos.qpg.enable:1",
+    "a=vqos.resControl.qp.qpg.featureSetting:7",
     "a=bwe.useOwdCongestionControl:1",
     "a=video.enableRtpNack:1",
     "a=vqos.bw.txRxLag.minFeedbackTxDeltaMs:200",
-    "a=vqos.adjustStreamingFpsDuringOutOfFocus:0",
+    "a=vqos.drc.bitrateIirFilterFactor:18",
+    "a=video.packetSize:1140",
+    "a=packetPacing.minNumPacketsPerGroup:15",
+    // High FPS (120+) optimizations from official GFN client
+    ...(isHighFps ? [
+      "a=bwe.iirFilterFactor:8",
+      "a=video.encoderFeatureSetting:47",
+      "a=video.encoderPreset:6",
+      "a=vqos.resControl.cpmRtc.badNwSkipFramesCount:600",
+      "a=vqos.resControl.cpmRtc.decodeTimeThresholdMs:9",
+      `a=video.fbcDynamicFpsGrabTimeoutMs:${is120Fps ? 6 : 18}`,
+      `a=vqos.resControl.cpmRtc.serverResolutionUpdateCoolDownCount:${is120Fps ? 6000 : 12000}`,
+    ] : []),
+    // Ultra high FPS (240+) optimizations
+    ...(is240Fps ? [
+      "a=video.enableNextCaptureMode:1",
+      "a=vqos.maxStreamFpsEstimate:240",
+      "a=video.videoSplitEncodeStripsPerFrame:3",
+      "a=video.updateSplitEncodeStateDynamically:1",
+    ] : []),
+    // Out of focus settings
+    "a=vqos.adjustStreamingFpsDuringOutOfFocus:1",
     "a=vqos.resControl.cpmRtc.ignoreOutOfFocusWindowState:1",
     "a=vqos.resControl.perfHistory.rtcIgnoreOutOfFocusWindowState:1",
     "a=vqos.resControl.cpmRtc.featureMask:3",
-    "a=packetPacing.numGroups:5",
+    // Packet pacing
+    `a=packetPacing.numGroups:${is120Fps ? 3 : 5}`,
+    "a=packetPacing.maxDelayUs:1000",
+    "a=packetPacing.minNumPacketsFrame:10",
+    // NACK settings
     "a=video.rtpNackQueueLength:1024",
     "a=video.rtpNackQueueMaxPackets:512",
     "a=video.rtpNackMaxPacketCount:25",
-    "a=vqos.drc.qpMaxResThresholdAdj:0",
-    "a=vqos.grc.qpMaxResThresholdAdj:0",
-    "a=vqos.drc.iirFilterFactor:0",
-    "a=video.videoSplitEncodeStripsPerFrame:63",
-    "a=video.updateSplitEncodeStateDynamically:1",
+    // Resolution/quality settings
+    "a=vqos.drc.qpMaxResThresholdAdj:4",
+    "a=vqos.grc.qpMaxResThresholdAdj:4",
+    "a=vqos.drc.iirFilterFactor:100",
+    // Viewport and FPS
     `a=video.clientViewportWd:${viewportWidth}`,
     `a=video.clientViewportHt:${viewportHeight}`,
+    `a=video.maxFPS:${requestedFps}`,
+    // Bitrate settings
     `a=video.initialBitrateKbps:${initialBitrateKbps}`,
     `a=video.initialPeakBitrateKbps:${initialBitrateKbps}`,
     `a=vqos.bw.maximumBitrateKbps:${maxBitrateKbps}`,
     `a=vqos.bw.minimumBitrateKbps:${minBitrateKbps}`,
+    // Encoder settings
     "a=video.maxNumReferenceFrames:4",
     "a=video.mapRtpTimestampsToFrames:1",
     "a=video.encoderCscMode:3",
     "a=video.scalingFeature1:0",
-    "a=video.prefilterParams.prefilterModel:4",
-    "a=packetPacing.enableAccurateSleep:1",
-    "a=video.adaptiveQuantization.perfAdjEnablement:1",
-    "a=video.adaptiveQuantization.spatialAQSetting:2",
-    "a=video.adaptiveQuantization.temporalAQSetting:2",
-    "a=video.enableAv1RcPrecisionFactor:0",
-    "a=video.framePacing.pid.minTargetFrameTimeUs:7936",
-    "a=video.parseRtcClientBlobs:1",
-    "a=vqos.grc.enable:0",
-    "a=vqos.qpDelta.qpDeltaIirFactor:60",
-    "a=vqos.qpDelta.qpDeltaSurfaceAdjustmentStrengthPercent:70",
-    "a=vqos.qpDelta.qpDeltaThrottlePercent:100",
-    "a=vqos.sendEndOfSessionQosTelemetry:1",
-    "a=vqos.statsProcessorThread.flags:249",
+    "a=video.prefilterParams.prefilterModel:0",
+    // Audio track
     "m=audio 0 RTP/AVP",
     "a=msid:audio",
+    // Mic track
     "m=mic 0 RTP/AVP",
     "a=msid:mic",
+    // Input/application track
     "m=application 0 RTP/AVP",
     "a=msid:input_1",
     "a=ri.partialReliableThresholdMs:300",
     ""
-  ].join("\r\n");
+  ].join("\n");
 
   console.log("Built nvstSdp with ICE credentials and streaming params");
 
@@ -1033,12 +1119,58 @@ async function handleGfnSdpOffer(
     console.error("WebSocket not open, cannot send answer! State:", ws.readyState);
   }
 
-  // IMPORTANT: Do NOT manually add ICE candidates!
-  // The server will send its ICE candidate via trickle ICE (peer_msg with candidate field)
-  // The trickle ICE handler at lines 431-447 will add it when received
-  // Server's candidate will be on port 19450 (not 47998 from SDP media line)
-  console.log("Answer sent. Waiting for server's trickle ICE candidate...");
-  console.log("Note: Server uses ice-lite and will send its candidate via peer_msg");
+  // For ice-lite servers that don't send trickle ICE candidates,
+  // we need to construct the candidate manually from the server IP and SDP port
+  console.log("Answer sent. Adding server ICE candidate manually for ice-lite...");
+
+  // Extract port from the SDP (from m=audio or m=video line)
+  const portMatch = serverSdp.match(/m=(?:audio|video)\s+(\d+)/);
+  const serverPort = portMatch ? parseInt(portMatch[1], 10) : 47998;
+
+  // Convert serverIp from hostname format to IP
+  // Format: 80-250-101-43.cloudmatchbeta.nvidiagrid.net -> 80.250.101.43
+  let serverIpAddress = serverIp;
+  const ipMatch = serverIp.match(/^(\d+-\d+-\d+-\d+)\./);
+  if (ipMatch) {
+    serverIpAddress = ipMatch[1].replace(/-/g, ".");
+    console.log("Converted server hostname to IP:", serverIpAddress);
+  }
+
+  // Extract ICE credentials from server SDP
+  const serverUfragMatch = serverSdp.match(/a=ice-ufrag:(\S+)/);
+  const serverUfrag = serverUfragMatch ? serverUfragMatch[1] : "";
+
+  // Construct the ICE candidate
+  // Format: candidate:foundation component protocol priority ip port typ type
+  const candidateString = `candidate:1 1 udp 2130706431 ${serverIpAddress} ${serverPort} typ host`;
+  console.log("Constructed server ICE candidate:", candidateString);
+
+  try {
+    await pc.addIceCandidate(new RTCIceCandidate({
+      candidate: candidateString,
+      sdpMid: "0",
+      sdpMLineIndex: 0,
+      usernameFragment: serverUfrag
+    }));
+    console.log("Successfully added server ICE candidate");
+  } catch (e) {
+    console.warn("Failed to add constructed ICE candidate:", e);
+    // Try alternative format with different sdpMid values
+    for (const mid of ["1", "2", "3"]) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate({
+          candidate: candidateString,
+          sdpMid: mid,
+          sdpMLineIndex: parseInt(mid, 10),
+          usernameFragment: serverUfrag
+        }));
+        console.log(`Added server ICE candidate with sdpMid=${mid}`);
+        break;
+      } catch (e2) {
+        // Continue trying
+      }
+    }
+  }
 }
 
 /**
@@ -1621,11 +1753,10 @@ async function waitForIceGathering(pc: RTCPeerConnection): Promise<void> {
  */
 function preferCodec(sdp: string, codec: string): string {
   // Map user codec selection to actual SDP codec name
-  // Note: H265 appears as "HEVC" in the SDP rtpmap, not "H265"
   const codecMap: Record<string, string> = {
     H264: "H264",
-    H265: "HEVC",   // SDP uses HEVC for H265
-    HEVC: "HEVC",
+    H265: "H265",
+    HEVC: "H265",   // HEVC is the same as H265
     AV1: "AV1",
   };
 
@@ -1993,24 +2124,13 @@ export function sendInputEvent(event: InputEvent): void {
   }
 
   inputEventCount++;
-  const now = Date.now();
 
-  // Log input state periodically (every 5 seconds) or on first input
-  const shouldLogStatus = inputEventCount === 1 || (now - lastInputLogTime > 5000);
-  if (shouldLogStatus) {
-    lastInputLogTime = now;
-    console.log("=== INPUT STATUS ===");
-    console.log(`  Events sent: ${inputEventCount}`);
-    console.log(`  Handshake complete: ${inputHandshakeComplete}`);
-    console.log(`  Handshake attempts: ${inputHandshakeAttempts}`);
-    console.log(`  Stream start time: ${streamStartTime}`);
+  // Log input state only on first input (avoid GC pauses from logging)
+  if (inputEventCount === 1) {
+    console.log("=== FIRST INPUT EVENT ===");
     console.log(`  Input channel: ${inputChannel?.label || 'none'} (${inputChannel?.readyState || 'n/a'})`);
-    console.log(`  Control channel: ${controlChannel?.label || 'none'} (${controlChannel?.readyState || 'n/a'})`);
-    console.log(`  Available channels:`);
-    streamingState.dataChannels.forEach((ch, name) => {
-      console.log(`    ${name}: ${ch.label} (state=${ch.readyState}, id=${ch.id})`);
-    });
-    console.log("====================");
+    console.log(`  Handshake complete: ${inputHandshakeComplete}`);
+    console.log("=========================");
   }
 
   try {
@@ -2558,8 +2678,11 @@ export function setupInputCapture(videoElement: HTMLVideoElement): () => void {
     );
   };
 
-  // Mouse move handler - uses getCoalescedEvents for raw, unsmoothed input
-  const handleMouseMove = (e: MouseEvent) => {
+  // Check if pointerrawupdate is supported (lower latency than pointermove)
+  const supportsRawUpdate = "onpointerrawupdate" in videoElement;
+
+  // Mouse move handler - uses pointerrawupdate for lowest latency when available
+  const handleMouseMove = (e: MouseEvent | PointerEvent) => {
     // In pointer lock mode, require pointer lock OR macOS cursor-hidden workaround
     if (inputCaptureMode === 'pointerlock') {
       // On macOS, use cursor-hidden mode with movementX/movementY (no actual pointer lock)
@@ -2568,13 +2691,23 @@ export function setupInputCapture(videoElement: HTMLVideoElement): () => void {
 
       if (canSendRelative) {
         // Use coalesced events for raw mouse data (no browser smoothing)
-        const events = (e as PointerEvent).getCoalescedEvents?.() || [e];
-        for (const evt of events) {
-          if (evt.movementX !== 0 || evt.movementY !== 0) {
+        // Skip coalescing for pointerrawupdate as it's already raw
+        if (e.type === "pointerrawupdate") {
+          if (e.movementX !== 0 || e.movementY !== 0) {
             sendInputEvent({
               type: "mouse_move",
-              data: { dx: evt.movementX, dy: evt.movementY },
+              data: { dx: e.movementX, dy: e.movementY },
             });
+          }
+        } else {
+          const events = (e as PointerEvent).getCoalescedEvents?.() || [e];
+          for (const evt of events) {
+            if (evt.movementX !== 0 || evt.movementY !== 0) {
+              sendInputEvent({
+                type: "mouse_move",
+                data: { dx: evt.movementX, dy: evt.movementY },
+              });
+            }
           }
         }
       }
@@ -2823,12 +2956,19 @@ export function setupInputCapture(videoElement: HTMLVideoElement): () => void {
   document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
   document.addEventListener("mozfullscreenchange", handleFullscreenChange);
   document.addEventListener("MSFullscreenChange", handleFullscreenChange);
-  document.addEventListener("pointermove", handleMouseMove as EventListener);
+  // Use pointerrawupdate for lowest latency when available, fallback to pointermove
+  if (supportsRawUpdate) {
+    document.addEventListener("pointerrawupdate", handleMouseMove as EventListener);
+    console.log("Using pointerrawupdate for low-latency mouse input");
+  } else {
+    document.addEventListener("pointermove", handleMouseMove as EventListener);
+    console.log("Using pointermove for mouse input (pointerrawupdate not supported)");
+  }
   document.addEventListener("mousedown", handleMouseDown);
   document.addEventListener("mouseup", handleMouseUp);
   document.addEventListener("wheel", handleWheel, { passive: false });
-  document.addEventListener("keydown", handleKeyDown);
-  document.addEventListener("keyup", handleKeyUp);
+  document.addEventListener("keydown", handleKeyDown, { passive: false });
+  document.addEventListener("keyup", handleKeyUp, { passive: false });
   window.addEventListener("blur", handleBlur);
 
   // Start in absolute mode - immediately active
@@ -2854,7 +2994,11 @@ export function setupInputCapture(videoElement: HTMLVideoElement): () => void {
     document.removeEventListener("webkitfullscreenchange", handleFullscreenChange);
     document.removeEventListener("mozfullscreenchange", handleFullscreenChange);
     document.removeEventListener("MSFullscreenChange", handleFullscreenChange);
-    document.removeEventListener("pointermove", handleMouseMove as EventListener);
+    if (supportsRawUpdate) {
+      document.removeEventListener("pointerrawupdate", handleMouseMove as EventListener);
+    } else {
+      document.removeEventListener("pointermove", handleMouseMove as EventListener);
+    }
     document.removeEventListener("mousedown", handleMouseDown);
     document.removeEventListener("mouseup", handleMouseUp);
     document.removeEventListener("wheel", handleWheel);
